@@ -1,19 +1,17 @@
-# Build directory & Binaries
-build/
-*.o
-*.so
-*.out
+# Build-Artefakte & Binaries
 cache_storage
+*.o
+build/
 
-# Scratch & temporary development files
-scratch/
-*.tmp
-*.log
-temp.py
-asd.temp
-
-# IDE & Editor settings
+# IDE- & Editor-Konfigurationen
 .vscode/
 .idea/
 *.swp
 *~
+
+# Lokale Hilfs- und Testdateien
+venv/
+temp.py
+asd.temp
+*.tmp
+*.log

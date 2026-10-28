@@ -2,180 +2,192 @@
 #define CACHE_STORAGE_H
 
 #define _GNU_SOURCE
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
-#include <stdatomic.h>
-#include <pthread.h>
+#include <sys/types.h>
 #include <x86intrin.h>
 
 /**
  * ============================================================================
- * Cache Timing Storage - Header
+ * Weird Storage Challenge: Volatile CPU-Cache Timing Storage (Flush+Reload)
  * ============================================================================
- * 
- * STRIDE: Speicherabstand in Bytes zwischen benachbarten Bit-Adressen.
- * 
- * Warum STRIDE >= 128 Bytes?
- * Moderne x86-CPUs verfügen über Spatial Prefetchers (z. B. Intel L2 Adjacent
- * Cache Line Prefetcher), die bei Zugriff auf eine 64-Byte-Cacheline die
- * benachbarte 64-Byte-Zeile ungefragt in den Cache laden. Ein Stride unter 128
- * Bytes würde Bit 1 fälschlicherweise auf Bit 0 übersprechen lassen.
- * 
- * Um zusätzlich den L1/L2 Stream-Prefetcher (der sequenzielle Sprünge erkennt)
- * zuverlässig abzufangen, wird der Default-Stride auf 4096 Bytes (eine Page)
- * gesetzt. Hardware-Prefetcher überschreiten Page-Grenzen (4KB) prinzipiell nicht.
+ *
+ * Mikroarchitektonische Konstanten:
+ * - CACHE_LINE_SIZE (64 Bytes): Größe einer Standard-x86_64-Cache-Line.
+ * - STRIDE (256 Bytes): Abstand zwischen zwei benachbarten Bit-Slots in der
+ *   Speicher-Arena. Da der Spatial/Adjacent-Cache-Line-Prefetcher immer Paare
+ *   zu je 128 Bytes (2 x 64B) lädt, verhindert ein Stride von 256 Bytes (4
+ *   Cache-Lines) das direkte Übersprechen benachbarter Bits.
+ * - CACHE_FRAME_BYTES (32 Bytes = 256 Bits): Maximale Anzahl gleichzeitig im
+ *   L1d/L2-Cache gehaltener Bits pro Frame, um Set-Associativity-Evictions
+ *   (Self-Thrashing bei großen Binärdateien) vollständig zu vermeiden.
  */
-#ifndef CACHE_STRIDE
-#define CACHE_STRIDE 4096
+#define CACHE_LINE_SIZE 64
+
+#ifndef STRIDE
+#define STRIDE 256
 #endif
 
-#define CACHE_MIN_STRIDE 128
-_Static_assert(CACHE_STRIDE >= CACHE_MIN_STRIDE,
-               "CACHE_STRIDE muss mindestens 128 Bytes betragen (Spatial Prefetcher Schutz)!");
+_Static_assert(STRIDE >= 128 && (STRIDE % CACHE_LINE_SIZE == 0),
+               "STRIDE muss ein Vielfaches von 64 und >= 128 Bytes sein!");
 
-/* Anzahl der Messungen für die dynamische Schwellenwert-Kalibrierung */
-#define CACHE_CALIBRATION_SAMPLES 500
+/* Maximale Frame-Größe im L1/L2-Cache pro Zyklus (32 Bytes = 256 Cache-Lines) */
+#define CACHE_FRAME_BYTES 32
+#define CACHE_FRAME_BITS  (CACHE_FRAME_BYTES * 8)
 
-/* Anzahl der Durchläufe für das Majority Voting beim Reader */
-#define CACHE_VOTING_ROUNDS 5
+/* Anzahl der Messungen pro Zustand (Hit / Miss) für die Median-Kalibrierung */
+#define CALIBRATION_SAMPLES 1000
+
+/* Standard-Anzahl der Lese-Durchläufe pro Bit für das Majority Voting */
+#define VOTING_ROUNDS 5
+
+/* Standard-CPU-Core für das Thread-Pinning (gemeinsamer L1d/L2-Cache) */
+#define DEFAULT_CORE_ID 0
+
+/* Standard-Haltedauer des flüchtigen Cache-Zustands in Sekunden */
+#define HOLD_DURATION_SEC 3
+
+/* POSIX Shared-Memory-Pfade für den prozessübergreifenden Daemon-Modus */
+#define SHM_ARENA_NAME "/weird_cache_arena"
+#define SHM_CTL_NAME   "/weird_cache_ctl"
+#define SHM_MAGIC      0x5745495244434831ULL /* "WEIRDCH1" */
 
 /**
- * Kalibrierungsdaten für Cache-Hits und Cache-Misses.
+ * Betriebsmodus des CLI-Tools.
+ */
+typedef enum {
+    MODE_DEMO = 0,   /* Klassischer All-in-One Lauf (Store -> Hold -> Load) */
+    MODE_STORE,      /* Startet Hintergrund-Daemon, hält Daten im Cache & beendet CLI */
+    MODE_LOAD,       /* Neuer Prozess: Rekonstruiert Daten aus dem Cache des Daemons */
+    MODE_STATUS,     /* Zeigt Status des Hintergrund-Cache-Daemons & RAM-Nullprüfung */
+    MODE_PURGE       /* Beendet Daemon, flusht alle Cache-Lines & gibt Shared-Arena frei */
+} storage_mode_t;
+
+/**
+ * Kalibrierungsergebnisse der Laufzeit-Latenzmessung (in CPU-Taktzyklen).
  */
 typedef struct {
-    uint64_t hit_median;    /* Median der Latenz bei Cache-Hit (L1/L2/L3) in CPU-Zyklen */
-    uint64_t miss_median;   /* Median der Latenz bei Cache-Miss (DRAM) in CPU-Zyklen */
-    uint64_t threshold;     /* Schwellenwert zur Bit-Klassifikation (Hit < threshold <= Miss) */
-} cache_calibration_t;
+    uint64_t hit_median;   /* Median für L1/L2 Cache-Hits (Bit 1) */
+    uint64_t miss_median;  /* Median für DRAM Cache-Misses (Bit 0) */
+    uint64_t threshold;    /* Dynamischer Entscheidungsschwellenwert */
+} calibration_data_t;
 
 /**
- * Thread-Kontext und Verwaltungsstruktur für den flüchtigen Cache-Speicher.
+ * Prozessübergreifender Steuerblock (enthält KEINE Nutzdaten, nur Frame-Sync & Metadaten).
+ * Die eigentliche Cache-Arena (/dev/shm/weird_cache_arena) bleibt zu 100% auf 0x00!
  */
 typedef struct {
-    uint8_t *arena;             /* Paginierte Speicher-Arena (mmap) */
-    size_t arena_size;          /* Gesamtgröße der Arena in Bytes */
-    uint8_t *payload_bits;      /* Bitmuster-Array für den Background-Worker (1 Byte pro Bit) */
-    size_t num_bits;            /* Aktuell geschriebene Bit-Anzahl */
-    size_t max_bits;            /* Maximale Kapazität in Bits */
-    int core_id;                /* Pinned CPU-Core ID */
-    cache_calibration_t calib;  /* Dynamisch ermittelte Schwellenwerte */
-    atomic_bool running;        /* Statusflag für den Worker-Thread */
-    pthread_t worker_thread;    /* Thread-Handle des Refresh-Workers */
-} cache_storage_t;
+    uint64_t magic;                       /* Signatur zur Validierung (SHM_MAGIC) */
+    pid_t daemon_pid;                     /* PID des Hintergrund-Cache-Keeper-Daemons */
+    int core_id;                          /* Physischer CPU-Kern des Daemons */
+    size_t payload_len;                   /* Gesamtgröße der Daten in Bytes */
+    size_t total_bits;                    /* Gesamtzahl der Bits */
+    size_t num_frames;                    /* Anzahl der 32-Byte L1-Cache-Frames */
+    size_t arena_size;                    /* Größe der 0x00-Cache-Arena in Bytes */
+    mode_t file_mode;                     /* Ursprüngliche Dateiberechtigungen */
+    bool is_file_payload;                 /* true = Datei, false = Text-String */
+    uint64_t orig_fnv1a_hash;             /* FNV-1a 64-Bit-Hash zur Verifikation beim Load */
+    char source_label[128];               /* Dateiname oder "(String-Payload)" */
+    char format_desc[96];                 /* Erkanntes Dateiformat (Magic Bytes) */
+    atomic_size_t requested_frame;        /* Vom Reader angeforderter Frame-Index */
+    atomic_size_t active_frame;           /* Vom Daemon aktuell im Cache gehaltener Frame */
+    atomic_uint_fast64_t frame_epoch;     /* Inkrementiert nach jedem Refresh-Durchlauf */
+    atomic_uint_fast64_t refresh_cycles;  /* Gesamtzahl der Refresh-Zyklen des Daemons */
+    atomic_bool stop_requested;           /* Signal zum sauberen Beenden des Daemons */
+} shared_control_t;
 
 /**
- * Hardware-Pinning: Bindet den aktuellen Thread / Prozess an einen bestimmten CPU-Kern.
- * 
- * @param core_id Numerische ID des CPU-Kerns (z. B. 0).
- * @return 0 bei Erfolg, -1 bei Fehler.
+ * Thread-Kontext für den Hintergrund-Refresh-Worker (Single-Process-Modus).
  */
-int pin_to_core(int core_id);
+typedef struct {
+    volatile uint8_t *arena;              /* Anonyme mmap-Arena (DRAM bleibt 0x00) */
+    size_t arena_size;                    /* Größe der Arena in Bytes */
+    const uint8_t *payload;               /* Zeiger auf den aktuellen Frame-Payload */
+    size_t payload_len;                   /* Größe des aktuellen Frames in Bytes */
+    size_t total_bits;                    /* Anzahl der Bits im aktuellen Frame */
+    int core_id;                          /* Physischer Ziel-CPU-Kern */
+    int voting_rounds;                    /* Konfigurierte Majority-Voting-Runden */
+    calibration_data_t calib;             /* Kalibrierte Timing-Parameter */
+    atomic_bool running;                  /* Laufzeit-Flag für die Worker-Schleife */
+    atomic_bool paused;                   /* Synchronisations-Flag beim Frame-Wechsel */
+    atomic_bool pause_ack;                /* Bestätigung des Workers bei Pause */
+    atomic_uint_fast64_t refresh_cycles;  /* Zähler für durchgeführte Refresh-Durchläufe */
+    pthread_t worker_thread;              /* POSIX-Thread-Handle des Refresh-Workers */
+} cache_context_t;
 
 /**
- * Hardware-Pinning für einen expliziten pthread-Thread.
- * 
- * @param thread Thread-Handle.
- * @param core_id Numerische ID des CPU-Kerns.
- * @return 0 bei Erfolg, errno bei Fehler.
+ * CLI-Konfigurationsstruktur für beliebige Dateiformate und Direkt-Payloads.
  */
-int pin_thread_to_core(pthread_t thread, int core_id);
+typedef struct {
+    storage_mode_t mode;       /* Gewählter Betriebsmodus (demo/store/load/status/purge) */
+    const char *input_path;    /* Pfad zur Eingabedatei (beliebiges Dateiformat) */
+    const char *output_path;   /* Optionaler Pfad zur rekonstruierten Ausgabedatei */
+    const char *raw_string;    /* Direkter String-Payload (falls keine Datei) */
+    int hold_seconds;          /* Haltedauer im CPU-Cache in Sekunden */
+    int core_id;               /* CPU-Core für Pinning */
+    int voting_rounds;         /* Majority-Voting-Runden pro Bit */
+    bool quiet_table;          /* Unterdrückt die große Byte-Tabelle */
+    bool full_table;           /* Erzwingt Ausgabe aller Bytes in der Tabelle */
+} cli_options_t;
 
 /**
- * Präzise zyklengenaue Latenzmessung für eine Speicheradresse.
- * 
- * Verwendet _mm_mfence(), __rdtscp() und _mm_lfence() zur vollständigen
- * Serialisierung der Pipeline und Messung der Ladezeit.
- * 
- * @param addr Zeiger auf die zu messende Speicheradresse.
- * @return Gemessene Dauer in CPU-Zyklen.
+ * Bindet den aufrufenden Thread mittels pthread_setaffinity_np fest an einen
+ * physischen CPU-Kern, damit Reader und Worker denselben L1/L2-Cache teilen.
  */
-static inline uint64_t cache_measure_latency(volatile void *addr) {
-    unsigned int dummy;
-    uint64_t start, end;
-
-    /* Pipeline-Drain und Serialisierung vor Zeitstempel */
-    _mm_mfence();
-    _mm_lfence();
-    start = __rdtscp(&dummy);
-    _mm_lfence();
-
-    /* Speicherzugriff (Touch) */
-    (void)*(volatile uint8_t *)addr;
-
-    /* Pipeline-Serialisierung nach Speicherzugriff */
-    _mm_mfence();
-    _mm_lfence();
-    end = __rdtscp(&dummy);
-    _mm_lfence();
-
-    return end - start;
-}
+int pin_thread_to_core(int core_id);
 
 /**
- * Dynamische Kalibrierung:
- * Führt 500 Hit- und 500 Miss-Messungen durch und berechnet den Schwellenwert.
- * 
- * @param calib Zeiger auf die Kalibrierungsstruktur.
- * @param sample_addr Referenzadresse im Speicher für die Messungen.
- * @return 0 bei Erfolg, negativer Wert bei Fehler.
+ * Misst die Speicherzugriffslatenz auf eine gegebene Adresse zyklengenau.
+ * Nutzt _mm_mfence(), _mm_lfence() und __rdtscp(&aux).
  */
-int cache_calibrate(cache_calibration_t *calib, volatile void *sample_addr);
+uint64_t measure_access(volatile uint8_t *addr);
 
 /**
- * Initialisiert die Cache-Storage-Arena via mmap.
- * 
- * @param max_bytes Maximale Nutzdaten-Kapazität in Bytes.
- * @param core_id Hardware-Kern für Storage und Worker.
- * @return Zeiger auf initialisierte cache_storage_t oder NULL bei Fehler.
+ * Ermittelt dynamisch den optimalen Schwellenwert (Threshold) zwischen Cache-Hit
+ * und Cache-Miss über den Median aus je 1000 Hit- und 1000 Miss-Messungen.
  */
-cache_storage_t *cache_storage_init(size_t max_bytes, int core_id);
+int calibrate_cache_timing(volatile uint8_t *arena, calibration_data_t *calib);
 
 /**
- * Schreibt Nutzdaten in den Cache-Speicher.
- * 
- * Wichtig: Das zugrundeliegende RAM bleibt genullt! Die Bits werden rein
- * über den Cache-Status (Hit = 1, Flushed = 0) kodiert.
- * 
- * @param storage Zeiger auf den Speicher-Kontext.
- * @param data Zeiger auf die zu speichernden Quelldaten.
- * @param len Länge der Daten in Bytes.
- * @return 0 bei Erfolg, -1 bei Fehler.
+ * Allokiert eine seitenausgerichtete, anonyme Speicher-Arena via mmap().
  */
-int cache_storage_write(cache_storage_t *storage, const void *data, size_t len);
+volatile uint8_t *allocate_cache_arena(size_t total_bits, size_t *out_arena_size);
 
 /**
- * Startet den Background-Worker-Thread, der die Cache-Zustände aktiv auffrischt.
- * 
- * @param storage Zeiger auf den Speicher-Kontext.
- * @return 0 bei Erfolg, negativer Wert bei Fehler.
+ * Gibt eine zuvor mit allocate_cache_arena() reservierte Speicher-Arena frei.
  */
-int cache_storage_start_refresh(cache_storage_t *storage);
+void free_cache_arena(volatile uint8_t *arena, size_t arena_size);
 
 /**
- * Beendet den Background-Worker-Thread.
- * 
- * @param storage Zeiger auf den Speicher-Kontext.
+ * Überträgt ein Bitmuster in den mikroarchitektonischen Zustand der Cache-Lines:
+ * - Bit 1: Lesezugriff lädt die Ziel-Cache-Line in den L1/L2-Cache (Hit).
+ * - Bit 0: _mm_clflush verdrängt die Cache-Line aus allen Cache-Ebenen (Miss).
  */
-void cache_storage_stop_refresh(cache_storage_t *storage);
+void encode_bits_to_cache(volatile uint8_t *arena, const uint8_t *data, size_t total_bits);
 
 /**
- * Liest die Nutzdaten rein aus den Cache-Timing-Latenzen aus.
- * 
- * Nutzt Majority Voting über mehrere Runden, um CPU-Jitter zu filtern.
- * 
- * @param storage Zeiger auf den Speicher-Kontext.
- * @param out_buf Zielpuffer für die rekonstruierten Daten.
- * @param len Anzahl der zu lesenden Bytes.
- * @return Anzahl der gelesenen Bytes oder -1 bei Fehler.
+ * Hintergrund-Thread-Routine (Single-Process-Demo).
  */
-int cache_storage_read(cache_storage_t *storage, void *out_buf, size_t len);
+void *cache_refresh_worker(void *arg);
 
 /**
- * Gibt alle allokierten Ressourcen (mmap, Buffer) frei.
- * 
- * @param storage Zeiger auf den Speicher-Kontext.
+ * Rekonstruiert die gespeicherten Daten eines Frames ausschließlich über
+ * Zeitmessungen (measure_access) auf den Cache-Line-Slots mittels Majority Voting.
  */
-void cache_storage_free(cache_storage_t *storage);
+int decode_from_cache(volatile uint8_t *arena,
+                      size_t payload_len,
+                      uint64_t threshold,
+                      int voting_rounds,
+                      uint8_t *out_buffer,
+                      uint64_t *out_avg_hit_cycles,
+                      uint64_t *out_avg_miss_cycles);
+
+/**
+ * Erkennt das Dateiformat anhand von Magic-Bytes (Datei-Signatur) und Inhalt.
+ */
+const char *detect_file_format(const uint8_t *data, size_t len, const char *filename);
 
 #endif /* CACHE_STORAGE_H */
