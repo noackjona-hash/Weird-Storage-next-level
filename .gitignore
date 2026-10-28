@@ -1,1 +1,19 @@
-.vscode
+# Build directory & Binaries
+build/
+*.o
+*.so
+*.out
+cache_storage
+
+# Scratch & temporary development files
+scratch/
+*.tmp
+*.log
+temp.py
+asd.temp
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*~
